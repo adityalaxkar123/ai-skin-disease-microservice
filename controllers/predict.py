@@ -37,14 +37,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import timm
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
+import timm
+from torchvision import transforms
 from PIL import Image
 
 # ── Default paths (relative to this file) ──────────────────────
 _ROOT = Path(__file__).resolve().parent
-_DEFAULT_MODEL_PATH = _ROOT / "models" / "best_skin_model.pth"
-_DEFAULT_CLASS_NAMES_PATH = _ROOT / "models" / "class_names.json"
+_DEFAULT_MODEL_PATH = _ROOT / "best_skin_model.pth"
+_DEFAULT_CLASS_NAMES_PATH = _ROOT / "class_names.json"
 
 # ── Constants (must match training config) ──────────────────────
 IMAGE_SIZE = 224
@@ -77,22 +77,20 @@ class SkinDiseasePredictor:
         self.model_path = Path(model_path) if model_path else _DEFAULT_MODEL_PATH
         self.class_names_path = Path(class_names_path) if class_names_path else _DEFAULT_CLASS_NAMES_PATH
 
-        # Device
-        if device:
-            self.device = torch.device(device)
-        else:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Force CPU and disable gradients to save memory
+        torch.set_grad_enabled(False)
+        self.device = torch.device("cpu")
 
         # Load class names
         with open(self.class_names_path, "r", encoding="utf-8") as f:
             self.class_names: List[str] = json.load(f)
 
         # Build preprocessing pipeline (matches training validation transform)
-        self.transform = A.Compose([
-            A.Resize(IMAGE_SIZE, IMAGE_SIZE),
-            A.Normalize(mean=[0.485, 0.456, 0.406],
-                        std=[0.229, 0.224, 0.225]),
-            ToTensorV2(),
+        self.transform = transforms.Compose([
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225]),
         ])
 
         # Build and load model
@@ -123,7 +121,7 @@ class SkinDiseasePredictor:
         """Load trained weights from checkpoint."""
         checkpoint = torch.load(
             self.model_path,
-            map_location=self.device,
+            map_location="cpu",
             weights_only=False,
         )
         self.model.load_state_dict(checkpoint["model_state_dict"])
@@ -131,8 +129,7 @@ class SkinDiseasePredictor:
     def _preprocess(self, pil_image: Image.Image) -> torch.Tensor:
         """Convert a PIL image to a model-ready tensor batch."""
         rgb = pil_image.convert("RGB")
-        arr = np.array(rgb)
-        transformed = self.transform(image=arr)["image"]  # C×H×W tensor
+        transformed = self.transform(rgb)  # C×H×W tensor
         return transformed.unsqueeze(0).to(self.device)    # 1×C×H×W
 
     # ── public prediction methods ───────────────────────────────
@@ -155,8 +152,8 @@ class SkinDiseasePredictor:
             - probabilities : dict, {class_name: probability} for all classes
         """
         image_path = Path(image_path)
-        pil_image = Image.open(image_path)
-        result = self._run_inference(pil_image)
+        with Image.open(image_path) as pil_image:
+            result = self._run_inference(pil_image)
         result["file"] = str(image_path)
         return result
 
@@ -183,8 +180,8 @@ class SkinDiseasePredictor:
         -------
         dict with keys: prediction, confidence, probabilities
         """
-        pil_image = Image.open(io.BytesIO(image_bytes))
-        return self._run_inference(pil_image)
+        with Image.open(io.BytesIO(image_bytes)) as pil_image:
+            return self._run_inference(pil_image)
 
     def predict_from_base64(self, b64_string: str) -> Dict:
         """
@@ -288,9 +285,13 @@ class SkinDiseasePredictor:
         """Run the model on a single PIL image and return structured results."""
         tensor = self._preprocess(pil_image)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             logits = self.model(tensor)
             probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
+            
+        # Free memory explicitly
+        del tensor
+        del logits
 
         idx = int(np.argmax(probs))
         label = self.class_names[idx]
